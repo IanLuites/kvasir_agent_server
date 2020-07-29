@@ -1,6 +1,6 @@
 defmodule Kvasir.AgentServer.MixProject do
   use Mix.Project
-  @version "0.0.1"
+  @version "0.0.3"
 
   def project do
     [
@@ -41,8 +41,8 @@ defmodule Kvasir.AgentServer.MixProject do
       licenses: ["MIT"],
       files: [
         # Elixir
-        "lib/agent_server",
-        "lib/agent_server.ex",
+        "lib/kvasir/agent_server",
+        "lib/kvasir/agent_server.ex",
         ".formatter.exs",
         "mix.exs",
         "README*",
@@ -63,7 +63,8 @@ defmodule Kvasir.AgentServer.MixProject do
   defp deps do
     [
       {:kvasir_agent, ">= 0.0.1"},
-      {:ranch, "~> 2.0", optional: true}
+      {:ranch, "~> 2.0", optional: true},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end
 end
