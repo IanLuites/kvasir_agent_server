@@ -8,41 +8,45 @@ defmodule Kvasir.AgentServer.Client do
 
   @transport :gen_tcp
   @pool_size 15
+  @latency 1_000
 
   @typep socket :: port
   @typep buffer :: [String.t()]
   @typep conn :: {socket, buffer}
 
-  @opts ~w(pool_size async)a
+  @opts ~w(pool_size async latency)a
 
   @doc @moduledoc
   @spec child_spec(opts :: Keyword.t()) :: Supervisor.child_spec()
   def child_spec(opts \\ []) do
     module = opts[:module] || raise "Need to set client module."
 
-    {host, port, id, pool_size} =
+    {host, port, id, pool_size, latency} =
       cond do
         url = opts[:url] ->
           case URI.parse(url) do
             %URI{scheme: "kvasir", host: host, port: port, path: "/" <> id, query: query} ->
-              {host, port || default_control_port(), id,
-               query
-               |> Kernel.||("")
-               |> URI.decode_query()
-               |> Map.get("pool_size", @pool_size)}
+              q = query |> Kernel.||("") |> URI.decode_query()
+
+              {host, port || default_control_port(), id, Map.get(q, "pool_size", @pool_size),
+               Map.get(q, "latency", @latency)}
 
             _ ->
               raise "Invalid Kvasir URI, expecting: `kvasir://<host>[:<port>]/<id>`."
           end
 
         opts[:host] && opts[:id] ->
-          {opts[:host], opts[:port] || default_control_port(), opts[:host], @pool_size}
+          {opts[:host], opts[:port] || default_control_port(), opts[:host], @pool_size, @latency}
 
         :missing ->
           raise "Need to set Kvasir AgentServer `url`; or `host` and `id`."
       end
 
-    o = opts |> Keyword.take(@opts) |> Keyword.put_new(:pool_size, pool_size)
+    o =
+      opts
+      |> Keyword.take(@opts)
+      |> Keyword.put_new(:pool_size, pool_size)
+      |> Keyword.put_new(:latency, latency)
 
     %{
       id: :kvasir_agent_server_client,
@@ -71,6 +75,11 @@ defmodule Kvasir.AgentServer.Client do
       |> Keyword.update(
         :pool_size,
         @pool_size,
+        &if(is_binary(&1), do: String.to_integer(&1), else: &1)
+      )
+      |> Keyword.update(
+        :latency,
+        @latency,
         &if(is_binary(&1), do: String.to_integer(&1), else: &1)
       )
 
@@ -111,6 +120,7 @@ defmodule Kvasir.AgentServer.Client do
   def initialize(parent, module, id, host, port, opts) do
     # Create Conn Pool
     pool_size = Keyword.get(opts, :pool_size, @pool_size)
+    latency = Keyword.get(opts, :latency, @latency)
 
     # Connect
     conn = try_connect(host, port)
@@ -121,12 +131,12 @@ defmodule Kvasir.AgentServer.Client do
 
     if parent do
       spawn_link(fn ->
-        connect_agents(module, agents, pool_size)
+        connect_agents(module, agents, pool_size, latency)
         send(parent, :done_generating_agents)
         control_loop(conn)
       end)
     else
-      connect_agents(module, agents, pool_size)
+      connect_agents(module, agents, pool_size, latency)
       control_loop(conn)
     end
   end
@@ -193,10 +203,10 @@ defmodule Kvasir.AgentServer.Client do
       end)
     end)
 
-    generate_client(module, agents, pool_size)
+    generate_client(module, agents, pool_size, latency)
   end
 
-  defp generate_client(module, agents, pool_size) do
+  defp generate_client(module, agents, pool_size, latency) do
     Code.compiler_options(ignore_module_conflict: true)
 
     if match?([_], agents) do
@@ -208,7 +218,11 @@ defmodule Kvasir.AgentServer.Client do
             use Kvasir.Command.Dispatcher
 
             def do_dispatch(cmd) do
-              Kvasir.AgentServer.Command.Connection.send_command(get_conn(), cmd)
+              Kvasir.AgentServer.Command.Connection.send_command(
+                get_conn(),
+                cmd,
+                unquote(latency)
+              )
             end
 
             defp get_conn do
@@ -217,7 +231,8 @@ defmodule Kvasir.AgentServer.Client do
               conn
             end
           end
-        end
+        end,
+        Path.join(__DIR__, "SingleConn.ex")
       )
     else
       conns =
@@ -257,12 +272,17 @@ defmodule Kvasir.AgentServer.Client do
             use Kvasir.Command.Dispatcher
 
             def do_dispatch(cmd = %{__meta__: %{scope: {:instance, key}}}) do
-              Kvasir.AgentServer.Command.Connection.send_command(get_conn(key), cmd)
+              Kvasir.AgentServer.Command.Connection.send_command(
+                get_conn(key),
+                cmd,
+                unquote(latency)
+              )
             end
 
             unquote(conns)
           end
-        end
+        end,
+        Path.join(__DIR__, "MultiConn.ex")
       )
     end
 
