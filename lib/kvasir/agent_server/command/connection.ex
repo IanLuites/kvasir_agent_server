@@ -2,23 +2,19 @@ defmodule Kvasir.AgentServer.Command.Connection do
   require Logger
   @transport :gen_tcp
   @socket_opts [:binary, active: false]
-  @latency 1_000
+  @linger_time 250
 
-  def create(id, host, port) do
-    {:ok, pid} = start_link(id, host, port)
+  def create(id, host, port, janitor) do
+    {:ok, pid} = start_link(id, host, port, janitor)
     {:ok, GenServer.call(pid, :get_conn)}
   end
 
-  def send_command(conn, command)
-  def send_command(err = {:error, _}, _cmd), do: err
+  def send_command(conn, command, latency)
+  def send_command(err = {:error, _}, _cmd, _latency), do: err
 
-  def send_command(conn, command = %{__meta__: m}) do
+  def send_command(conn, command = %{__meta__: m}, latency) do
+    need_response = m.wait != :dispatch
     {registry, socket} = conn
-    response = m.wait != :dispatch
-
-    if response do
-      :ets.insert(registry, {m.id, self()})
-    end
 
     cmd = %{
       command
@@ -28,12 +24,20 @@ defmodule Kvasir.AgentServer.Command.Connection do
     packed = :erlang.term_to_binary(cmd, minor_version: 2, compressed: 9)
     size = byte_size(packed)
 
+    wait_time = m.timeout + latency
+
+    if need_response do
+      :ets.insert(
+        registry,
+        {m.id, self(), :erlang.system_time(:millisecond) + wait_time + @linger_time}
+      )
+    end
+
     with :ok <- @transport.send(socket, [<<size::unsigned-integer-32>>, packed]) do
-      if response do
-        wait_for_response(command, m.timeout + @latency)
-      else
-        {:ok, command}
-      end
+      if need_response, do: wait_for_response(command, wait_time), else: :ok
+    else
+      {:error, :no_socket, _} -> {:error, :agent_server_connection_lost}
+      err -> err
     end
   end
 
@@ -55,18 +59,19 @@ defmodule Kvasir.AgentServer.Command.Connection do
     end
   end
 
-  def start_link(id, host, port) do
-    GenServer.start_link(__MODULE__, {id, host, port})
+  def start_link(id, host, port, janitor) do
+    GenServer.start_link(__MODULE__, {id, host, port, janitor})
   end
 
   @behaviour GenServer
 
   @impl GenServer
-  def init({id, host, port}) do
+  def init({id, host, port, janitor}) do
     h = if(is_binary(host), do: String.to_charlist(host), else: host)
 
     {:ok, socket} = @transport.connect(h, port, @socket_opts)
     registry = :ets.new(:registry, [:set, :public, write_concurrency: true])
+    send(janitor, {:add_table, registry})
     reader = spawn_link(fn -> response_loop(id, registry, h, port, socket) end)
 
     {:ok, %{id: id, socket: socket, registry: registry, reader: reader}}
@@ -84,7 +89,7 @@ defmodule Kvasir.AgentServer.Command.Connection do
             {ref, _} -> ref
           end
 
-        with [{^ref, pid}] <- :ets.take(registry, ref), do: send(pid, response)
+        with [{^ref, pid, _}] <- :ets.take(registry, ref), do: send(pid, response)
 
         response_loop(id, registry, host, port, socket)
 

@@ -182,7 +182,9 @@ defmodule Kvasir.AgentServer.Client do
     end
   end
 
-  defp connect_agents(module, agents, pool_size) do
+  defp connect_agents(module, agents, pool_size, latency) do
+    {:ok, janitor} = DynamicSupervisor.start_child(module, Kvasir.AgentServer.Command.Janitor)
+
     agents
     |> Enum.with_index()
     |> Enum.each(fn {%{host: h, port: p}, i} ->
@@ -194,7 +196,8 @@ defmodule Kvasir.AgentServer.Client do
           DynamicSupervisor.start_child(module, %{
             id: {i, pool_i},
             start:
-              {Kvasir.AgentServer.Command.Connection, :start_link, [{pool, pool_i - 1}, h, p]}
+              {Kvasir.AgentServer.Command.Connection, :start_link,
+               [{pool, pool_i - 1}, h, p, janitor]}
           })
 
         conn = GenServer.call(pid, :get_conn)
