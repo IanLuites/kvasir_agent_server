@@ -26,7 +26,7 @@ defmodule Kvasir.AgentServer.Util do
     num_listen_sockets = num_conns_sups = num_acceptors = recommended_num_accepters()
 
     %{
-      max_connections: 3000,
+      max_connections: 6000,
       num_listen_sockets: num_listen_sockets,
       num_conns_sups: num_conns_sups,
       num_acceptors: num_acceptors,
