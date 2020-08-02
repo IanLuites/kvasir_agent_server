@@ -3,16 +3,14 @@ defmodule Kvasir.AgentServer.Client do
   Documentation for `Kvasir.AgentServer.Client`.
   """
   use DynamicSupervisor
-  import Kvasir.AgentServer, only: [default_control_port: 0]
+  alias Kvasir.AgentServer.Client.ConnectionManager
+  alias Kvasir.AgentServer.Config
   require Logger
 
-  @transport :gen_tcp
   @pool_size 15
   @latency 1_000
 
-  @typep socket :: port
-  @typep buffer :: [String.t()]
-  @typep conn :: {socket, buffer}
+  @typep conn :: atom
 
   @opts ~w(pool_size async latency)a
 
@@ -20,33 +18,7 @@ defmodule Kvasir.AgentServer.Client do
   @spec child_spec(opts :: Keyword.t()) :: Supervisor.child_spec()
   def child_spec(opts \\ []) do
     module = opts[:module] || raise "Need to set client module."
-
-    {host, port, id, pool_size, latency} =
-      cond do
-        url = opts[:url] ->
-          case URI.parse(url) do
-            %URI{scheme: "kvasir", host: host, port: port, path: "/" <> id, query: query} ->
-              q = query |> Kernel.||("") |> URI.decode_query()
-
-              {host, port || default_control_port(), id, Map.get(q, "pool_size", @pool_size),
-               Map.get(q, "latency", @latency)}
-
-            _ ->
-              raise "Invalid Kvasir URI, expecting: `kvasir://<host>[:<port>]/<id>`."
-          end
-
-        opts[:host] && opts[:id] ->
-          {opts[:host], opts[:port] || default_control_port(), opts[:host], @pool_size, @latency}
-
-        :missing ->
-          raise "Need to set Kvasir AgentServer `url`; or `host` and `id`."
-      end
-
-    o =
-      opts
-      |> Keyword.take(@opts)
-      |> Keyword.put_new(:pool_size, pool_size)
-      |> Keyword.put_new(:latency, latency)
+    {connect, o} = Keyword.split(Config.connection(opts), ~w(id host port)a)
 
     %{
       id: :kvasir_agent_server_client,
@@ -54,7 +26,7 @@ defmodule Kvasir.AgentServer.Client do
       shutdown: :infinity,
       type: :supervisor,
       modules: [__MODULE__],
-      start: {__MODULE__, :start_link, [module, id, host, port, o]}
+      start: {__MODULE__, :start_link, [module, connect[:id], connect[:host], connect[:port], o]}
     }
   end
 
@@ -68,20 +40,7 @@ defmodule Kvasir.AgentServer.Client do
   def start_link(module, id, host, port, opts \\ []) do
     h = if(is_binary(host), do: String.to_charlist(host), else: host)
     p = if(is_binary(port), do: String.to_integer(port), else: port)
-
-    o =
-      opts
-      |> Keyword.take(@opts)
-      |> Keyword.update(
-        :pool_size,
-        @pool_size,
-        &if(is_binary(&1), do: String.to_integer(&1), else: &1)
-      )
-      |> Keyword.update(
-        :latency,
-        @latency,
-        &if(is_binary(&1), do: String.to_integer(&1), else: &1)
-      )
+    o = Keyword.take(Config.connection(opts), @opts)
 
     if Keyword.get(opts, :async, false) do
       DynamicSupervisor.start_link(__MODULE__, {nil, module, id, h, p, o}, name: module)
@@ -100,13 +59,8 @@ defmodule Kvasir.AgentServer.Client do
 
   @impl DynamicSupervisor
   def init({parent, module, id, host, port, opts}) do
-    if Keyword.get(opts, :async, false) do
-      spawn_link(fn -> initialize(nil, module, id, host, port, opts) end)
-      DynamicSupervisor.init(strategy: :one_for_one)
-    else
-      initialize(parent, module, id, host, port, opts)
-      DynamicSupervisor.init(strategy: :one_for_one)
-    end
+    spawn_link(fn -> initialize(parent, module, id, host, port, opts) end)
+    DynamicSupervisor.init(strategy: :one_for_one)
   end
 
   @spec initialize(
@@ -123,68 +77,98 @@ defmodule Kvasir.AgentServer.Client do
     latency = Keyword.get(opts, :latency, @latency)
 
     # Connect
-    conn = try_connect(host, port)
+    {:ok, conn} = ConnectionManager.connect(host, port, self())
+    wait_for_ready!(conn)
 
     # Wait till ready, then fetch and connect agents
-    {:ok, conn} = wait_for_status(conn, "ready")
-    {agents, conn} = connect(conn, id)
-
-    if parent do
-      spawn_link(fn ->
-        connect_agents(module, agents, pool_size, latency)
-        send(parent, :done_generating_agents)
-        control_loop(conn)
-      end)
-    else
-      connect_agents(module, agents, pool_size, latency)
-      control_loop(conn)
-    end
-  end
-
-  @spec try_connect(charlist, pos_integer, pos_integer) :: conn | no_return()
-  defp try_connect(host, port, attempt \\ 1) do
-    socket_opts = [:binary, active: false]
-
-    result =
-      case @transport.connect(host, port, socket_opts) do
-        {:ok, socket} ->
-          case read_line({socket, []}) do
-            {"HELLO " <> _, conn} -> {:ok, conn}
-            err -> {:error, err}
-          end
-
-        err ->
-          {:error, err}
-      end
-
-    case result do
-      {:ok, conn} ->
-        conn
-
-      {:error, err} ->
-        if attempt > 5,
-          do:
-            raise(
-              "AgentServer Client failed to connect to: #{host}:#{port} after #{attempt} attempts."
-            )
-
-        timeout = attempt * 500
-
-        Logger.error(fn ->
-          "AgentServer Client failed to connect to: #{host}:#{port} (attempt ##{attempt}), retrying in #{
-            timeout
-          }ms. (Reason: #{inspect(err)})"
-        end)
-
-        :timer.sleep(timeout)
-
-        try_connect(host, port, attempt + 1)
-    end
-  end
-
-  defp connect_agents(module, agents, pool_size, latency) do
+    agents = wait_for_agents!(conn, id)
     {:ok, janitor} = DynamicSupervisor.start_child(module, Kvasir.AgentServer.Command.Janitor)
 
+    connect_agents(module, agents, janitor, pool_size, latency)
+    parent && send(parent, :done_generating_agents)
+    control_loop(conn, module, id, agents, janitor, pool_size, latency)
+  end
+
+  # @spec control_loop(conn) :: no_return
+  defp control_loop(conn, module, id, agents, janitor, pool_size, latency) do
+    receive do
+      {^conn, :agent, ^id, ags} ->
+        regenerate_agents(module, agents, ags, janitor, pool_size, latency)
+        control_loop(conn, module, id, ags, janitor, pool_size, latency)
+
+      {^conn, :agent, _, _} ->
+        control_loop(conn, module, id, agents, janitor, pool_size, latency)
+
+      {^conn, :status, :closed} ->
+        regenerate_agents(module, agents, [], janitor, pool_size, latency)
+        control_loop(conn, module, id, [], janitor, pool_size, latency)
+
+      {^conn, :status, :ready} ->
+        ags = ConnectionManager.agents(conn, id)
+        regenerate_agents(module, agents, ags, janitor, pool_size, latency)
+        control_loop(conn, module, id, ags, janitor, pool_size, latency)
+
+      _ ->
+        # Add some checks here
+        control_loop(conn, module, id, agents, janitor, pool_size, latency)
+    end
+  end
+
+  @spec wait_for_ready!(conn) :: :ok
+  defp wait_for_ready!(conn) do
+    unless ConnectionManager.status(conn) == :ready, do: do_wait_for_ready!(conn)
+
+    :ok
+  end
+
+  defp do_wait_for_ready!(conn) do
+    receive do
+      {^conn, :status, :ready} ->
+        :ok
+
+      _ ->
+        # Add some checks here
+        do_wait_for_ready!(conn)
+    end
+  end
+
+  defp wait_for_agents!(conn, id) do
+    with [] <- ConnectionManager.agents(conn, id), do: do_wait_for_agents!(conn, id)
+  end
+
+  defp do_wait_for_agents!(conn, id) do
+    receive do
+      {^conn, :agent, ^id, agents} ->
+        agents
+
+      _ ->
+        # Add some checks here
+        do_wait_for_agents!(conn, id)
+    end
+  end
+
+  defp regenerate_agents(module, old_agents, new_agents, janitor, pool_size, latency)
+  defp regenerate_agents(_, agents, agents, _, _, _), do: :ok
+
+  defp regenerate_agents(module, old_agents, new_agents, janitor, pool_size, latency) do
+    # Close old connections
+    if old_agents != [] do
+      module
+      |> DynamicSupervisor.which_children()
+      |> Enum.filter(&(elem(&1, 3) == [Kvasir.AgentServer.Command.Connection]))
+      |> Enum.each(&DynamicSupervisor.terminate_child(module, elem(&1, 1)))
+    end
+
+    # Connect new
+    connect_agents(module, new_agents, janitor, pool_size, latency)
+  end
+
+  defp connect_agents(module, agents, janitor, pool_size, latency)
+
+  defp connect_agents(module, [], _janitor, pool_size, latency),
+    do: generate_client(module, [], pool_size, latency)
+
+  defp connect_agents(module, agents, janitor, pool_size, latency) do
     agents
     |> Enum.with_index()
     |> Enum.each(fn {%{host: h, port: p}, i} ->
@@ -207,6 +191,23 @@ defmodule Kvasir.AgentServer.Client do
     end)
 
     generate_client(module, agents, pool_size, latency)
+  end
+
+  defp generate_client(module, [], _pool_size, _latency) do
+    Code.compiler_options(ignore_module_conflict: true)
+
+    Code.compile_quoted(
+      quote do
+        defmodule unquote(module) do
+          use Kvasir.Command.Dispatcher
+
+          def do_dispatch(_cmd), do: {:error, :agent_server_connection_lost}
+        end
+      end,
+      Path.join(__DIR__, "BufferConn.ex")
+    )
+
+    Code.compiler_options(ignore_module_conflict: false)
   end
 
   defp generate_client(module, agents, pool_size, latency) do
@@ -290,107 +291,5 @@ defmodule Kvasir.AgentServer.Client do
     end
 
     Code.compiler_options(ignore_module_conflict: false)
-  end
-
-  ### Wait For A Given Status
-  @spec wait_for_status(conn, String.t()) :: {:ok, conn}
-  defp wait_for_status(conn, status) do
-    _send(conn, "STATUS")
-    do_wait(conn, "STATUS #{status}")
-  end
-
-  @spec do_wait(conn, String.t()) :: {:ok, conn}
-  defp do_wait(conn, line) do
-    case read_line(conn) do
-      {^line, conn} -> {:ok, conn}
-      {_, conn} -> do_wait(conn, line)
-    end
-  end
-
-  ### Connect ###
-
-  @spec connect(conn, String.t()) :: {[map], conn}
-  defp connect(conn, id) do
-    send_raw(conn, ["CONNECT ", id, ?\n])
-
-    {"LIST " <> _, conn} = read_line(conn)
-    do_connect(conn)
-  end
-
-  @spec do_connect(conn, [map]) :: {[map], conn}
-  defp do_connect(conn, acc \\ []) do
-    case read_line(conn) do
-      {"DONE " <> _, conn} ->
-        {:lists.reverse(acc), conn}
-
-      {line, conn} ->
-        [id, target, port, partition] = String.split(line, " ", parts: 4)
-
-        agent = %{
-          id: id,
-          host: target,
-          port: String.to_integer(port),
-          partition: parse_partition(partition)
-        }
-
-        do_connect(conn, [agent | acc])
-    end
-  end
-
-  @spec parse_partition(String.t()) :: term
-  defp parse_partition(partition)
-  defp parse_partition("*"), do: {:_, [], Elixir}
-
-  defp parse_partition(partition) do
-    [match, compare, value] = String.split(partition, " ")
-
-    {parse_partition_match(match),
-     {parse_operator(compare), [context: Elixir, import: Kernel],
-      [{:x, [], Elixir}, parse_value(value)]}}
-  end
-
-  defp parse_partition_match("."), do: {:x, [], Elixir}
-
-  defp parse_partition_match(pattern) do
-    pattern
-    |> String.split(".", trim: true)
-    |> :lists.reverse()
-    |> Enum.reduce({:x, [], Elixir}, fn k, acc -> {:%{}, [], [{String.to_atom(k), acc}]} end)
-  end
-
-  defp parse_operator("="), do: :==
-  defp parse_operator("<"), do: :<
-  defp parse_operator("<="), do: :<=
-  defp parse_operator(">"), do: :>
-  defp parse_operator(">="), do: :>=
-
-  defp parse_value(":" <> atom), do: String.to_atom(atom)
-  defp parse_value("\"" <> string), do: String.slice(string, 0..-2)
-  defp parse_value("true"), do: true
-  defp parse_value("false"), do: false
-  defp parse_value(value), do: String.to_integer(value)
-
-  ### Primitives ###
-
-  @spec _send(conn, binary | iolist) :: :ok
-  defp _send({socket, _}, data), do: @transport.send(socket, [data, ?\n])
-
-  @spec send_raw(conn, binary | iolist) :: :ok
-  defp send_raw({socket, _}, data), do: @transport.send(socket, data)
-
-  @spec control_loop(conn) :: no_return
-  defp control_loop(conn) do
-    receive do
-      :hold_it -> control_loop(conn)
-    end
-  end
-
-  @spec read_line(conn) :: {String.t(), conn}
-  defp read_line(conn)
-  defp read_line({socket, [line | buffer]}), do: {line, {socket, buffer}}
-
-  defp read_line({socket, []}) do
-    {:ok, data} = @transport.recv(socket, 0, :infinity)
-    read_line({socket, String.split(data, ~r/\r?\n/, trim: true)})
   end
 end
