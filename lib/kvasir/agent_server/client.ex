@@ -173,7 +173,9 @@ defmodule Kvasir.AgentServer.Client do
     |> Enum.with_index()
     |> Enum.each(fn {%{host: h, port: p}, i} ->
       pool = :"#{module}.Pool#{i}"
-      :ets.new(pool, [:named_table, :public, :set, read_concurrency: true])
+
+      if :ets.info(pool) == :undefined,
+        do: :ets.new(pool, [:named_table, :public, :set, read_concurrency: true])
 
       Enum.each(1..pool_size, fn pool_i ->
         {:ok, pid} =
