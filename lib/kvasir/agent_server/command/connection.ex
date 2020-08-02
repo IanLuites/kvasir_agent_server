@@ -34,7 +34,7 @@ defmodule Kvasir.AgentServer.Command.Connection do
     end
 
     with :ok <- @transport.send(socket, [<<size::unsigned-integer-32>>, packed]) do
-      if need_response, do: wait_for_response(command, wait_time), else: :ok
+      if need_response, do: wait_for_response(command, wait_time), else: {:ok, command}
     else
       {:error, :no_socket, _} -> {:error, :agent_server_connection_lost}
       err -> err
