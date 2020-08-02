@@ -126,4 +126,15 @@ defmodule Kvasir.AgentServer.Command.Connection do
   def handle_call(:get_conn, _from, state = %{registry: r, socket: s}) do
     {:reply, {r, s}, state}
   end
+
+  @impl GenServer
+  def terminate(_reason, state = %{janitor: janitor, registry: registry}) do
+    Process.exit(state.reader, :kill)
+    @transport.close(state.socket)
+
+    send(janitor, {:add_table, registry})
+    :ets.delete(registry)
+
+    :ok
+  end
 end
