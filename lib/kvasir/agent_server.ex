@@ -3,6 +3,16 @@ defmodule Kvasir.AgentServer do
   Documentation for `Kvasir.AgentServer`.
   """
 
+  @type id :: atom | reference()
+  @type status :: :unknown | :ready | :reconfiguring | :starting
+  @type agent :: %{
+          server: id,
+          id: String.t(),
+          agent: module,
+          partition: String.t(),
+          opts: Keyword.t()
+        }
+
   @default_control_port 9393
   @default_agent_ports [
     9397,
@@ -43,22 +53,16 @@ defmodule Kvasir.AgentServer do
   @spec default_agent_ports :: [pos_integer()]
   def default_agent_ports, do: @default_agent_ports
 
-  @type id :: atom | reference()
-  @type agent :: %{
-          server: id,
-          id: String.t(),
-          agent: module,
-          partition: String.t(),
-          opts: Keyword.t()
-        }
-
   use Supervisor
+  alias Kvasir.AgentServer.Config
+  @opts ~w(warmup)a
 
   @doc @moduledoc
   @spec child_spec(opts :: Keyword.t()) :: Supervisor.child_spec()
   def child_spec(opts \\ []) do
     server = opts[:id] || make_ref()
     agents = agents(opts[:agents])
+    o = Keyword.take(opts, @opts)
 
     %{
       id: server,
@@ -66,19 +70,20 @@ defmodule Kvasir.AgentServer do
       shutdown: :infinity,
       type: :supervisor,
       modules: [__MODULE__],
-      start: {__MODULE__, :start_link, [server, agents]}
+      start: {__MODULE__, :start_link, [server, agents, o]}
     }
   end
 
   @doc false
-  @spec start_link(id :: id, agents :: [agent]) :: Supervisor.on_start()
-  def start_link(id, agents)
+  @spec start_link(id :: id, agents :: [agent], Keyword.t()) :: Supervisor.on_start()
+  def start_link(id, agents, opts \\ [])
 
-  def start_link(id, agents) do
+  def start_link(id, agents, opts) do
     ensure_ranch!()
 
     {:ok, ips} = :inet.getif()
     {ip, _, _} = List.first(ips)
+    o = Keyword.take(opts, @opts)
 
     agents =
       agents
@@ -90,22 +95,23 @@ defmodule Kvasir.AgentServer do
       end)
 
     if is_atom(id) do
-      Supervisor.start_link(__MODULE__, {id, agents}, name: id)
+      Supervisor.start_link(__MODULE__, {id, agents, o}, name: id)
     else
-      Supervisor.start_link(__MODULE__, {id, agents})
+      Supervisor.start_link(__MODULE__, {id, agents, o})
     end
   end
 
   @impl Supervisor
-  def init({id, agents}) do
+  def init({id, agents, opts}) do
     :ets.new(id, [:named_table, :set, :protected, read_concurrency: true])
-
-    :ets.insert(id, {:agents, agents})
+    Config.set_status(id, :reconfiguring)
+    Config.set_agents(id, agents)
 
     children = [
-      # {__MODULE__.Config, server: id, agents: agents},
+      {__MODULE__.Config, server: id},
       {__MODULE__.Control.Handler, server: id},
-      {__MODULE__.AgentManager, agents: agents}
+      {__MODULE__.AgentManager,
+       server: id, agents: agents, warmup: Keyword.get(opts, :warmup, false)}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

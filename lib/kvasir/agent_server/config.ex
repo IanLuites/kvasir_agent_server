@@ -3,6 +3,27 @@ defmodule Kvasir.AgentServer.Config do
   Documentation for `Kvasir.AgentServer.Config`.
   """
 
+  def child_spec(_opts \\ []) do
+    %{id: :config, start: {:pg, :start_link, []}}
+  end
+
+  @spec status(Kvasir.AgentServer.id()) :: Kvasir.AgentServer.status()
+  def status(server) do
+    case :ets.lookup(server, :status) do
+      [{:status, s}] -> s
+      _ -> :unknown
+    end
+  end
+
+  @spec set_status(Kvasir.AgentServer.id(), Kvasir.AgentServer.status()) :: :ok
+  def set_status(server, status) do
+    :ets.insert(server, {:status, status})
+
+    {server, :status} |> :pg.get_members() |> Enum.each(&send(&1, {:status, server, status}))
+
+    :ok
+  end
+
   @spec agents(Kvasir.AgentServer.id()) :: [Kvasir.AgentServer.agent()]
   def agents(server) do
     case :ets.lookup(server, :agents) do
