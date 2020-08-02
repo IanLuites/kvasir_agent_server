@@ -1,6 +1,6 @@
 defmodule Kvasir.AgentServer.MixProject do
   use Mix.Project
-  @version "0.0.3"
+  @version "0.0.5"
 
   def project do
     [
@@ -56,7 +56,8 @@ defmodule Kvasir.AgentServer.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {Kvasir.AgentServer.Application, []}
     ]
   end
 
