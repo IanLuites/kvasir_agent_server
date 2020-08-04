@@ -3,6 +3,8 @@ defmodule Kvasir.AgentServer.Command.Connection do
   @transport :gen_tcp
   @socket_opts [:binary, active: false]
   @linger_time 250
+  @heartbeat_interval 60_000
+  @ping_pong <<0, 0, 0, 0>>
 
   def create(id, host, port, janitor) do
     {:ok, pid} = start_link(id, host, port, janitor)
@@ -77,8 +79,11 @@ defmodule Kvasir.AgentServer.Command.Connection do
     {:ok, %{id: id, socket: socket, registry: registry, reader: reader}}
   end
 
-  defp response_loop(id, registry, host, port, socket) do
-    case @transport.recv(socket, 4, :infinity) do
+  defp response_loop(id, registry, host, port, socket, flagged \\ false) do
+    case @transport.recv(socket, 4, @heartbeat_interval) do
+      {:ok, @ping_pong} ->
+        response_loop(id, registry, host, port, socket, false)
+
       {:ok, <<length::unsigned-integer-32>>} ->
         {:ok, data} = @transport.recv(socket, length, :infinity)
         response = :erlang.binary_to_term(data)
@@ -93,13 +98,27 @@ defmodule Kvasir.AgentServer.Command.Connection do
 
         response_loop(id, registry, host, port, socket)
 
+      {:error, :timeout} ->
+        if flagged do
+          disconnected(id, registry, host, port, socket)
+        else
+          @transport.send(socket, @ping_pong)
+          response_loop(id, registry, host, port, socket, true)
+        end
+
       {:error, :closed} ->
-        # Clear REF
-        {pool, index} = id
-        :ets.insert(pool, {index, {:error, :agent_server_connection_lost}})
-        Logger.error(fn -> "AgentServer: Connection Lost" end)
-        connect_loop(id, registry, host, port)
+        disconnected(id, registry, host, port, socket)
     end
+  end
+
+  defp disconnected(id, registry, host, port, socket) do
+    @transport.close(socket)
+
+    # Clear REF
+    {pool, index} = id
+    :ets.insert(pool, {index, {:error, :agent_server_connection_lost}})
+    Logger.error(fn -> "AgentServer: Connection Lost" end)
+    connect_loop(id, registry, host, port)
   end
 
   defp connect_loop(id, registry, host, port, attempt \\ 1) do

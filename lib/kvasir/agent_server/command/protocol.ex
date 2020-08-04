@@ -1,6 +1,8 @@
 defmodule Kvasir.AgentServer.Command.Protocol do
   require Logger
   @read_timeout 1_000
+  @heartbeat_interval 60_000
+  @ping_pong <<0, 0, 0, 0>>
 
   def start_link(ref, transport, _agent = %{agent: agent, counter: counter}) do
     {:ok, spawn_link(__MODULE__, :init, [ref, transport, agent, counter])}
@@ -13,7 +15,7 @@ defmodule Kvasir.AgentServer.Command.Protocol do
   end
 
   defp loop(socket, transport, agent, counter) do
-    case transport.recv(socket, 4, :infinity) do
+    case transport.recv(socket, 4, 2 * @heartbeat_interval) do
       {:ok, <<length::unsigned-integer-32>>} ->
         parent = self()
 
@@ -27,6 +29,8 @@ defmodule Kvasir.AgentServer.Command.Protocol do
 
         :counters.add(counter, 1, 1)
         loop(socket, transport, agent, counter)
+      {:error, :timeout} ->
+        transport.close(socket)
 
       {:error, :closed} ->
         transport.close(socket)
