@@ -16,6 +16,27 @@ defmodule Kvasir.AgentServer.Control.Server do
   @spec handle_command([String.t()], term) :: :ok | {:reply, iodata()}
   def handle_command(command, server)
 
+  def handle_command(["REBUILD", topic | opts], server) do
+    [key | part] = :lists.reverse(opts)
+    partition = part |> :lists.reverse() |> Enum.join(" ")
+
+    if agent =
+         Enum.find_value(
+           Config.agents(server, topic),
+           &if(&1.partition == partition, do: &1.agent)
+         ) do
+      with {:ok, p_key} <- agent.__agent__(:key).parse(key),
+           true <- match_partition?(partition, p_key) || {:error, :key_partition_mismatch},
+           :ok <- agent.rebuild(p_key) do
+        {:reply, "OK\n"}
+      else
+        {:error, err} -> {:reply, "ERR #{inspect(err)}\n"}
+      end
+    else
+      {:reply, "ERR unknown_agent\n"}
+    end
+  end
+
   def handle_command(["CONNECT" | opts], server) do
     if id = List.first(opts) do
       a =
@@ -86,4 +107,38 @@ defmodule Kvasir.AgentServer.Control.Server do
 
     status_loop(socket, transport, server)
   end
+
+  ### Partition Matching ###
+  @spec match_partition?(String.t(), term) :: boolean
+  defp match_partition?(partition, key)
+  defp match_partition?("*", _key), do: true
+
+  defp match_partition?(partition, key) do
+    [match, compare, value] = String.split(partition, " ")
+
+    match = match_partition_match(match, key)
+    value = match_partition_value(value)
+
+    match_partition_compare(compare, match, value)
+  end
+
+  defp match_partition_match(".", key), do: key
+
+  defp match_partition_match(pattern, key) do
+    pattern
+    |> String.split(".", trim: true)
+    |> Enum.reduce(key, &MapX.get(&2, String.to_atom(&1)))
+  end
+
+  defp match_partition_compare("=", match, value), do: match == value
+  defp match_partition_compare("<", match, value), do: match < value
+  defp match_partition_compare("<=", match, value), do: match <= value
+  defp match_partition_compare(">", match, value), do: match > value
+  defp match_partition_compare(">=", match, value), do: match >= value
+
+  defp match_partition_value(":" <> atom), do: String.to_atom(atom)
+  defp match_partition_value("\"" <> string), do: String.slice(string, 0..-2)
+  defp match_partition_value("true"), do: true
+  defp match_partition_value("false"), do: false
+  defp match_partition_value(value), do: String.to_integer(value)
 end
