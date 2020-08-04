@@ -4,22 +4,26 @@ defmodule Kvasir.AgentServer.Command.Protocol do
   @heartbeat_interval 60_000
   @ping_pong <<0, 0, 0, 0>>
 
-  def start_link(ref, transport, _agent = %{agent: agent, counter: counter}) do
-    {:ok, spawn_link(__MODULE__, :init, [ref, transport, agent, counter])}
+  def start_link(ref, transport, {_agent = %{agent: agent, counter: counter}, metrics}) do
+    {:ok, spawn_link(__MODULE__, :init, [ref, transport, agent, metrics, counter])}
   end
 
-  def init(ref, transport, agent, counter) do
+  def init(ref, transport, agent, metrics, counter) do
     # Apply to not warn for client only
     {:ok, socket} = apply(:ranch, :handshake, [ref])
-    loop(socket, transport, agent, counter)
+    loop(socket, transport, agent, metrics, counter)
   end
 
-  defp loop(socket, transport, agent, counter) do
+  defp loop(socket, transport, agent, metrics, counter) do
     case transport.recv(socket, 4, 2 * @heartbeat_interval) do
+      {:ok, @ping_pong} ->
+        transport.send(socket, @ping_pong)
+        loop(socket, transport, agent, metrics, counter)
+
       {:ok, <<length::unsigned-integer-32>>} ->
         parent = self()
 
-        spawn(fn -> grab_command(socket, transport, agent, parent, length) end)
+        spawn(fn -> grab_command(socket, transport, agent, metrics, parent, length) end)
 
         receive do
           :next_command -> :ok
@@ -28,7 +32,8 @@ defmodule Kvasir.AgentServer.Command.Protocol do
         end
 
         :counters.add(counter, 1, 1)
-        loop(socket, transport, agent, counter)
+        loop(socket, transport, agent, metrics, counter)
+
       {:error, :timeout} ->
         transport.close(socket)
 
@@ -41,11 +46,12 @@ defmodule Kvasir.AgentServer.Command.Protocol do
     end
   end
 
-  defp grab_command(socket, transport, agent, parent, length) do
+  defp grab_command(socket, transport, agent, metrics, parent, length) do
     with {:ok, data} <- transport.recv(socket, length, @read_timeout),
          send(parent, :next_command),
          {:ok, cmd} <- unpack(data) do
       dispatch(socket, transport, agent, cmd)
+      if metrics, do: metrics.(cmd)
     else
       err ->
         Logger.error(fn -> "AgentServer: Error parsing command: #{inspect(err)}" end)
