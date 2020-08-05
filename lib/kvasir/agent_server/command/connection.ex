@@ -100,6 +100,7 @@ defmodule Kvasir.AgentServer.Command.Connection do
 
       {:error, :timeout} ->
         if flagged do
+          Logger.error("AgentServer: Command-Conn Heartbeat Ping-Pong Failed (timeout)")
           disconnected(id, registry, host, port, socket)
         else
           @transport.send(socket, @ping_pong)

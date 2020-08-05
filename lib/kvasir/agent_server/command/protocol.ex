@@ -1,11 +1,11 @@
 defmodule Kvasir.AgentServer.Command.Protocol do
   require Logger
-  @read_timeout 1_000
+  @read_timeout 2_500
   @heartbeat_interval 60_000
   @ping_pong <<0, 0, 0, 0>>
 
-  def start_link(ref, transport, {_agent = %{agent: agent, counter: counter}, metrics}) do
-    {:ok, spawn_link(__MODULE__, :init, [ref, transport, agent, metrics, counter])}
+  def start_link(ref, transport, _agent = %{agent: agent, counter: counter}) do
+    {:ok, spawn_link(__MODULE__, :init, [ref, transport, agent, counter])}
   end
 
   def init(ref, transport, agent, metrics, counter) do
@@ -35,6 +35,10 @@ defmodule Kvasir.AgentServer.Command.Protocol do
         loop(socket, transport, agent, metrics, counter)
 
       {:error, :timeout} ->
+        Logger.error(
+          "AgentServer: Command-Conn Heartbeat Heartbeat Failed (Client Did Not PingPong)"
+        )
+
         transport.close(socket)
 
       {:error, :closed} ->
